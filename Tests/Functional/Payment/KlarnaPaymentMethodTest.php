@@ -22,6 +22,7 @@ use Psr\Log\NullLogger;
 use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Core\Http\Stream;
+use TYPO3\CMS\Core\Site\Entity\Site;
 
 final class KlarnaPaymentMethodTest extends AbstractKlarnaMockTestCase
 {
@@ -90,12 +91,41 @@ final class KlarnaPaymentMethodTest extends AbstractKlarnaMockTestCase
         $this->assertSame(PaymentStatus::PAID, $result->getPaymentStatus());
     }
 
+    /**
+     * Klarna calls the status_update URL on every step of the hosted payment page. Until the session is
+     * completed the customer is still paying: the order must neither be placed at Klarna nor accepted.
+     */
     #[Test]
-    public function handleWebhookStaysPendingForAWaitingSession(): void
+    public function handleWebhookLeavesThePaymentUnchangedForASessionStillInProgress(): void
     {
         $result = $this->subject()->handleWebhook($this->webhookRequest('hpp_session_waiting'), $this->order());
 
-        $this->assertSame(PaymentResultState::PENDING, $result->getState());
+        $this->assertSame(PaymentResultState::UNCHANGED, $result->getState());
+        $this->assertSame(0, $this->recordedRequests(self::PLACE_ORDER_PATH));
+    }
+
+    #[Test]
+    public function handleWebhookFailsForASessionTheShopperCancelled(): void
+    {
+        $result = $this->subject()->handleWebhook($this->webhookRequest('hpp_session_cancelled'), $this->order());
+
+        $this->assertSame(PaymentResultState::FAILED, $result->getState());
+    }
+
+    /**
+     * The return already placed the order and Klarna holds it for a fraud review; the completed session's
+     * status_update must not place it a second time, which Klarna would refuse - failing a placed order.
+     */
+    #[Test]
+    public function handleWebhookDoesNotPlaceAnOrderAgainThatIsAlreadyPendingReview(): void
+    {
+        $order = $this->order();
+        $order->setPaymentStatus(PaymentStatus::PENDING);
+
+        $result = $this->subject()->handleWebhook($this->webhookRequest('hpp_session_1'), $order);
+
+        $this->assertSame(PaymentResultState::UNCHANGED, $result->getState());
+        $this->assertSame(0, $this->recordedRequests(self::PLACE_ORDER_PATH));
     }
 
     #[Test]
@@ -106,6 +136,57 @@ final class KlarnaPaymentMethodTest extends AbstractKlarnaMockTestCase
         $result = $this->subject()->handleWebhook($request, $this->order());
 
         $this->assertSame(PaymentResultState::FAILED, $result->getState());
+    }
+
+    /**
+     * Gateway callbacks run as middlewares before the page is resolved, where core has not published the
+     * request globally yet. Credentials configured only on the site must still be found - from the site of
+     * the callback request itself.
+     */
+    #[Test]
+    public function handleWebhookUsesTheCredentialsOfTheRequestsSite(): void
+    {
+        $subject = new KlarnaPaymentMethod(
+            new KlarnaConfigurationFactory($this->siteOnlyConfiguration(), new CurrentSiteResolver()),
+            $this->client(),
+            new KlarnaOrderPayloadBuilder(),
+            $this->get(EventDispatcherInterface::class),
+            new NullLogger(),
+        );
+
+        $result = $subject->handleWebhook($this->siteOnlyRequest($this->webhookRequest('hpp_session_1')), $this->order());
+
+        $this->assertSame(PaymentStatus::PAID, $result->getPaymentStatus());
+    }
+
+    private function siteOnlyRequest(ServerRequestInterface $request): ServerRequestInterface
+    {
+        unset($GLOBALS['TYPO3_REQUEST']);
+        $site = new Site('shop', 1, [
+            'base' => 'https://shop.example/',
+            'settings' => [
+                'products' => [
+                    'payment' => [
+                        'klarna' => [
+                            'environment' => 'playground',
+                            'username' => 'mock-user',
+                            'password' => 'mock-pass',
+                            'apiBaseUrl' => $this->mockRoot . '/payment/klarna',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        return $request->withAttribute('site', $site);
+    }
+
+    private function siteOnlyConfiguration(): ApiSettingsResolver
+    {
+        $extensionConfiguration = $this->createMock(ExtensionConfiguration::class);
+        $extensionConfiguration->method('get')->willReturn([]);
+
+        return new ApiSettingsResolver($extensionConfiguration);
     }
 
     private function subject(): KlarnaPaymentMethod

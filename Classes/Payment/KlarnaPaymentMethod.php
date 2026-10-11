@@ -102,7 +102,7 @@ final class KlarnaPaymentMethod implements RedirectPaymentMethodInterface
             return PaymentResult::failed('Klarna did not return an authorization token on the return URL.');
         }
 
-        return $this->placeOrder($authorizationToken, $order);
+        return $this->placeOrder($authorizationToken, $order, $this->configurationFactory->forRequest($request));
     }
 
     public function handleWebhook(ServerRequestInterface $request, Order $order): PaymentResult
@@ -113,12 +113,11 @@ final class KlarnaPaymentMethod implements RedirectPaymentMethodInterface
             return PaymentResult::failed('Klarna webhook carried no session id.');
         }
 
-        return $this->finalizeFromWebhook($sessionId, $order);
+        return $this->finalizeFromWebhook($sessionId, $order, $this->configurationFactory->forRequest($request));
     }
 
-    private function finalizeFromWebhook(string $sessionId, Order $order): PaymentResult
+    private function finalizeFromWebhook(string $sessionId, Order $order, KlarnaConfiguration $configuration): PaymentResult
     {
-        $configuration = $this->configurationFactory->forCurrentRequest();
         try {
             // Klarna does not sign its callback, so an authenticated re-read is the verification: only the
             // shop's credentials can make Klarna report the real status for this session.
@@ -127,19 +126,27 @@ final class KlarnaPaymentMethod implements RedirectPaymentMethodInterface
             $this->logger->error('Klarna session verification failed.', ['exception' => $exception]);
             return PaymentResult::failed('Klarna webhook could not be verified: ' . $exception->getMessage());
         }
+        // Klarna calls the status_update URL on every step of the hosted payment page; only a final state
+        // settles anything.
+        if ($status->hasFailed()) {
+            return PaymentResult::failed(sprintf('The Klarna payment ended as "%s".', $status->status), $sessionId);
+        }
         if (!$status->isCompleted() || $status->authorizationToken === '') {
-            return PaymentResult::pending();
+            return PaymentResult::unchanged($sessionId);
+        }
+        if ($order->getPaymentStatus() !== PaymentStatus::OPEN) {
+            // The customer's return placed the order already; Klarna refuses a second placement.
+            return PaymentResult::unchanged($sessionId);
         }
 
-        return $this->placeOrder($status->authorizationToken, $order);
+        return $this->placeOrder($status->authorizationToken, $order, $configuration);
     }
 
-    private function placeOrder(string $authorizationToken, Order $order): PaymentResult
+    private function placeOrder(string $authorizationToken, Order $order, KlarnaConfiguration $configuration): PaymentResult
     {
         if ($order->getPaymentStatus() === PaymentStatus::PAID) {
             return PaymentResult::completed(PaymentStatus::PAID);
         }
-        $configuration = $this->configurationFactory->forCurrentRequest();
         $payload = $this->orderPayloadBuilder->build(
             $order->getTotalGross()->getCents(),
             $order->getCurrency(),
